@@ -5,15 +5,50 @@ used as a VSG into an EPIQ Sidekiq X40. Cabled use only, never into an antenna.
 
 Waveform: 5.18 GHz, 40 MS/s, 1 MHz linear chirp, 50 µs pulse (or any width), 2 ms PRI, TX channel A only.
 
-## Setup (once)
+## Setup (once per computer)
 
-1. `brew install uhd cmake` and Python 3 with numpy and matplotlib.
-2. Point UHD at the LibreSDR FPGA image (bkerler's `LibreSDR_UHD_B220_Mini_FPGA`) in `~/.config/uhd.conf`:
+Nothing is flashed to the radio. Like the Ettus B210 it copies, the LibreSDR keeps no firmware or FPGA image of
+its own: every time it powers up, UHD on the computer loads both over USB. So each computer that drives it needs
+these two files once. After that it is plug and play: plug in, run `lfm_tx`.
+
+1. **Tools:** `brew install uhd cmake`, and Python 3 with numpy and matplotlib.
+
+2. **USB-chip firmware** (`usrp_b200_fw.hex`). Homebrew's UHD doesn't include it. Get it from Ettus and put it
+   where `lfm_tx` looks (`~/.local/share/uhd/images`):
+   ```bash
+   mkdir -p ~/.local/share/uhd/images && cd "$(mktemp -d)"
+   curl -fsSLO https://files.ettus.com/binaries/cache/b2xx/uhd-7f7d016/b2xx_common_fw_default-g7f7d016.zip
+   echo "22ac0e54cc90d53d8494d481439447a0c89b9bbaced6fabe24df260eda3ce3a3  b2xx_common_fw_default-g7f7d016.zip" | shasum -a 256 -c
+   unzip -q b2xx_common_fw_default-g7f7d016.zip && find . -name usrp_b200_fw.hex -exec cp {} ~/.local/share/uhd/images/ \;
+   ```
+
+3. **LibreSDR FPGA image** (bkerler's `LibreSDR_UHD_B220_Mini_FPGA`, the same one ATHENA-Skydar uses). The stock
+   Ettus FPGA image does not work on this board.
+   ```bash
+   mkdir -p ~/.local/share/libresdr
+   curl -fsSL -o ~/.local/share/libresdr/usrp_b210_fpga_b220mini.bin \
+     https://raw.githubusercontent.com/bkerler/LibreSDR_UHD_B220_Mini_FPGA/main/usrp_b210_fpga.bin
+   shasum -a 256 ~/.local/share/libresdr/usrp_b210_fpga_b220mini.bin
+   # tested with c503101c6c130fe43f253b969d2a09f28b7cd7392389e73a3598a5305df89005
+   ```
+
+4. **Tell UHD to use that image.** Create `~/.config/uhd.conf` (use the full path; `~` is not expanded here):
    ```
    [type=b200]
-   fpga=/path/to/usrp_b210_fpga_b220mini.bin
+   fpga=/Users/<you>/.local/share/libresdr/usrp_b210_fpga_b220mini.bin
    ```
-3. `./setup_tx.sh` builds `tx_lfm_pulse` into `~/.local/lib/b220-tx` and installs `lfm_tx`, `vsg_tx` and `loopback_check` into `~/.local/bin`.
+   This applies to every B200-family radio on the computer. If a real Ettus B200/B210 is also used there,
+   use `[serial=<LibreSDR serial>]` instead of `[type=b200]`.
+
+5. **Build and install:** `./setup_tx.sh` builds `tx_lfm_pulse` into `~/.local/lib/b220-tx` and installs
+   `lfm_tx`, `vsg_tx` and `loopback_check` into `~/.local/bin`.
+
+6. **Check:** plug the LibreSDR into a USB 3 port and run
+   ```bash
+   UHD_IMAGES_DIR=~/.local/share/uhd/images uhd_find_devices --args type=b200
+   ```
+   It should list one B200-family device. A freshly plugged board first shows as "WestBridge" at 480 Mb/s
+   until the firmware loads; that's normal.
 
 ## Transmit
 
