@@ -105,6 +105,10 @@ def main():
     ap.add_argument("--title", default=None)
     ap.add_argument("--out", default=None, help="PNG path (default: FILE with .png)")
     a = ap.parse_args()
+    if not a.rate > 0 or (a.ref_rate is not None and not a.ref_rate > 0):
+        sys.exit("--rate and --ref-rate must be positive")
+    if not (a.pw > 0 and a.chirp_bw > 0 and a.pris > 0):
+        sys.exit("--pw, --chirp-bw and --pris must be positive")
 
     fs = a.fullscale or (32768.0 if a.dtype == "int16" else 1.0)
     x = load(a.file, a.dtype, int(a.skip * a.rate))
@@ -112,6 +116,8 @@ def main():
     if m.get("mode") != "pulse":
         sys.exit(f"no pulses found in {a.file} (mode {m.get('mode')}); nothing to plot")
     starts, stops = find_pulses(x, a.rate)
+    if starts.size == 0:
+        sys.exit(f"no complete pulse in {a.file}; nothing to plot")
     label = a.label or os.path.basename(a.file)
 
     ref = None
@@ -182,7 +188,10 @@ def main():
     # 4. spectrum
     ax = axs[3]
     f, psd = spectrum(x, a.rate, starts, stops)
-    ax.plot(f / 1e6, psd, color=BLUE, linewidth=1.2, label=label)
+    if f is not None:
+        ax.plot(f / 1e6, psd, color=BLUE, linewidth=1.2, label=label)
+    else:
+        print("warning: no pulse far enough from the file edges for a spectrum", file=sys.stderr)
     span = 2.0 * a.chirp_bw
     if ref:
         fr, psdr = spectrum(xr, rr, rs, re_)

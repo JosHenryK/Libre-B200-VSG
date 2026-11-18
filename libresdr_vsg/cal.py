@@ -38,21 +38,35 @@ OVERLAP_TOL_DB = 0.5     # flag gains where two segments disagree by more than t
 def build(points_path, table_path):
     vsg = defaultdict(list)
     sdr = defaultdict(list)
+    need = {"source", "segment", "setting", "measured_dbfs"}
     with open(points_path, newline="") as f:
-        for row in csv.DictReader(f):
-            src = row["source"].strip().lower()
-            seg = row["segment"].strip()
-            setting = float(row["setting"])
-            meas = float(row["measured_dbfs"])
-            if src == "vsg":
-                vsg[seg].append((setting, meas))
-            elif src == "sdr":
-                ampl = float(row["ampl"])
-                if not 0 < ampl <= 1:
-                    sys.exit(f"bad ampl {ampl} in row {row}")
-                sdr[seg].append((setting, ampl, meas))
-            else:
-                sys.exit(f"unknown source {src!r}")
+        reader = csv.DictReader(f)
+        missing = need - set(reader.fieldnames or [])
+        if missing:
+            sys.exit(f"{points_path}: missing column(s) {', '.join(sorted(missing))}")
+        for line, row in enumerate(reader, start=2):
+            if not any((v or "").strip() for v in row.values()):
+                continue  # blank line
+            try:
+                src = row["source"].strip().lower()
+                seg = row["segment"].strip()
+                setting = float(row["setting"])
+                meas = float(row["measured_dbfs"])
+                if not (math.isfinite(setting) and math.isfinite(meas)):
+                    raise ValueError("non-finite value")
+                if src == "vsg":
+                    vsg[seg].append((setting, meas))
+                elif src == "sdr":
+                    ampl = float(row.get("ampl") or "nan")
+                    if not 0 < ampl <= 1:
+                        sys.exit(f"{points_path} line {line}: ampl must be in (0, 1], got {row.get('ampl')!r}")
+                    sdr[seg].append((setting, ampl, meas))
+                else:
+                    sys.exit(f"{points_path} line {line}: unknown source {src!r} (expected vsg or sdr)")
+            except (ValueError, AttributeError) as e:
+                sys.exit(f"{points_path} line {line}: bad value ({e}): {row}")
+    if not sdr:
+        sys.exit(f"{points_path}: no sdr rows; nothing to calibrate")
 
     warnings = []
     by_gain = defaultdict(list)
@@ -60,6 +74,8 @@ def build(points_path, table_path):
         ref = vsg.get(seg, [])
         if len(ref) < 2:
             sys.exit(f"segment {seg!r} has {len(ref)} VSG points; need at least 2")
+        if len({r[0] for r in ref}) < 2:
+            sys.exit(f"segment {seg!r}: VSG points need at least 2 different dBm levels")
         dbm = np.array([r[0] for r in ref])
         meas = np.array([r[1] for r in ref])
         slope, icpt = np.polyfit(dbm, meas, 1)
@@ -108,16 +124,33 @@ def build(points_path, table_path):
 
 def load_table(path):
     g, d = [], []
-    with open(path, newline="") as f:
-        for row in csv.DictReader(f):
-            g.append(float(row["gain_db"]))
-            d.append(float(row["dbm_fs"]))
+    try:
+        with open(path, newline="") as f:
+            for line, row in enumerate(csv.DictReader(f), start=2):
+                try:
+                    g.append(float(row["gain_db"]))
+                    d.append(float(row["dbm_fs"]))
+                except (KeyError, TypeError, ValueError):
+                    sys.exit(f"{path} line {line}: needs numeric gain_db and dbm_fs columns")
+    except OSError as e:
+        sys.exit(f"cannot read calibration table: {e}")
     if len(g) < 2:
         sys.exit("calibration table needs at least 2 rows")
-    return np.array(g), np.array(d)
+    g, d = np.array(g), np.array(d)
+    if not (np.all(np.isfinite(g)) and np.all(np.isfinite(d))):
+        sys.exit(f"{path}: non-finite values in the table")
+    if np.any(np.diff(g) <= 0):
+        sys.exit(f"{path}: gain_db must be strictly increasing (interpolation needs sorted gains)")
+    return g, d
+
+
+def check_ampl(ampl):
+    if not 0 < ampl <= 1:
+        sys.exit(f"--ampl must be in (0, 1], got {ampl}")
 
 
 def gain_for(table, dbm, ampl):
+    check_ampl(ampl)
     g, d = load_table(table)
     if np.any(np.diff(d) <= 0):
         sys.exit("table is not monotonic; rebuild it before inverting")
@@ -126,11 +159,13 @@ def gain_for(table, dbm, ampl):
         lo, hi = d[0] + 20 * math.log10(ampl), d[-1] + 20 * math.log10(ampl)
         sys.exit(f"{dbm:+.2f} dBm is outside the calibrated range {lo:+.2f}..{hi:+.2f} dBm at ampl {ampl}; "
                  "no extrapolation")
-    # UHD sets B200 TX gain in 0.25 dB steps.
-    print(f"{round(float(np.interp(want, d, g)) * 4) / 4:.2f}")
+    # UHD sets B200 TX gain in 0.25 dB steps; keep the rounded value inside the table.
+    gain = round(float(np.interp(want, d, g)) * 4) / 4
+    print(f"{min(max(gain, g[0]), g[-1]):.2f}")
 
 
 def dbm_for(table, gain, ampl):
+    check_ampl(ampl)
     g, d = load_table(table)
     if not g[0] <= gain <= g[-1]:
         sys.exit(f"gain {gain} is outside the calibrated range {g[0]}..{g[-1]}; no extrapolation")

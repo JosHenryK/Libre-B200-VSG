@@ -13,27 +13,59 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
 else
   BREW="/home/linuxbrew/.linuxbrew/bin/brew"
 fi
-UHD_VERSION="${UHD_VERSION:-4.11.0.0}"   # must match the Homebrew uhd formula
+UHD_VERSION="${UHD_VERSION:-}"   # default: the installed Homebrew uhd version (examples must match it)
 INSTALL_DIR="${HOME}/.local/lib/b220-tx"
 BUILD="${INSTALL_DIR}/build"
 BIN_DIR="${HOME}/.local/bin"
 REPO_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-RAW="https://raw.githubusercontent.com/EttusResearch/uhd/v${UHD_VERSION}/host/examples"
 
 die() { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
 [[ "$(id -u)" -ne 0 ]] || die "Run as your normal user, not with sudo."
 # numpy for cal.py / measure_iq.py. Checked before loading Homebrew's
 # environment, because that puts Homebrew's own python3 (often without numpy)
 # first on PATH, while vsg_tx runs with your normal PATH.
+# matplotlib is needed for lfm_tx's waveform plot and plot_iq.py.
 if ! python3 -c 'import numpy' 2>/dev/null; then
   if [[ "$(uname -s)" == "Darwin" ]]; then
-    die "python3 ($(command -v python3)) has no numpy. Install it and rerun."
+    die "python3 ($(command -v python3)) has no numpy. Install it (python3 -m pip install numpy matplotlib) and rerun."
   fi
   sudo apt-get install -y python3-numpy
+fi
+if ! python3 -c 'import matplotlib' 2>/dev/null; then
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    echo "WARNING: python3 ($(command -v python3)) has no matplotlib; lfm_tx will skip its waveform plot." >&2
+    echo "         Install it with: python3 -m pip install matplotlib" >&2
+  else
+    sudo apt-get install -y python3-matplotlib
+  fi
 fi
 [[ -x "$BREW" ]] || die "Homebrew not found. Run ATHENA-Skydar setup.sh first (Pi) or install Homebrew (Mac)."
 eval "$("$BREW" shellenv)"
 brew list uhd >/dev/null 2>&1 || die "Homebrew uhd is not installed (brew install uhd cmake)."
+command -v cmake >/dev/null 2>&1 || die "cmake not found (brew install cmake)."
+if [[ -z "$UHD_VERSION" ]]; then
+  # "uhd 4.11.0.0_1" -> "4.11.0.0" (drop Homebrew's revision suffix)
+  UHD_VERSION="$(brew list --versions uhd | awk '{ print $2 }' | sed 's/_[0-9]*$//')"
+  [[ -n "$UHD_VERSION" ]] || die "Could not read the Homebrew uhd version; set UHD_VERSION=x.y.z.w and rerun."
+fi
+echo "Homebrew UHD: $UHD_VERSION"
+# Built only after UHD_VERSION is known (it is empty until detected above).
+RAW="https://raw.githubusercontent.com/EttusResearch/uhd/v${UHD_VERSION}/host/examples"
+
+# A second UHD install (MacPorts, conda/radioconda) first on PATH is a common
+# source of trouble: its uhd_find_devices loads a different firmware into the
+# board. The installed scripts always use Homebrew's, but warn so it is known.
+OTHER_UHD="$(type -ap uhd_find_devices 2>/dev/null | grep -v "^$(brew --prefix)" | head -1 || true)"
+if [[ -n "$OTHER_UHD" ]]; then
+  echo "WARNING: another UHD is on PATH ($OTHER_UHD). lfm_tx/vsg_tx/loopback_check use Homebrew's UHD;" >&2
+  echo "         run UHD tools by full path ($(brew --prefix)/bin/...) or remove the other install." >&2
+fi
+
+# Homebrew's UHD ships no B200 firmware; the scripts look in ~/.local/share/uhd/images.
+if [[ -z "${UHD_IMAGES_DIR:-}" && ! -f "${HOME}/.local/share/uhd/images/usrp_b200_fw.hex" ]]; then
+  echo "WARNING: ~/.local/share/uhd/images/usrp_b200_fw.hex is missing; the LibreSDR cannot load its" >&2
+  echo "         USB firmware with Homebrew's UHD. See README setup step 2." >&2
+fi
 
 for f in lfm_tx.sh vsg_tx.sh loopback_check.sh tx_lfm_pulse.cpp cal.py measure_iq.py plot_iq.py plot_lfm.py; do
   [[ -f "${REPO_DIR}/${f}" ]] || die "${f} not found next to this script."

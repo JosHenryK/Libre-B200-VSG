@@ -32,6 +32,24 @@ MEASURE="${LIB}/measure_iq.py"
 OUTDIR="${HOME}/libresdr_loopback/$(date +%Y%m%d_%H%M%S)"
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+# uhd_find_devices from the SAME UHD install that tx_lfm_pulse is linked against.
+# A second UHD earlier on PATH (e.g. MacPorts in /opt/local) loads its own, different
+# firmware into the board, which the Homebrew-built transmitter then streams through.
+uhd_find_for_tx() {
+  local lib="" c
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    lib="$(otool -L "$1" 2>/dev/null | awk '/libuhd/ { print $1; exit }')"
+  else
+    lib="$(ldd "$1" 2>/dev/null | awk '/libuhd/ { print $3; exit }')"
+  fi
+  for c in ${lib:+"$(dirname "$lib")/../bin/uhd_find_devices"} \
+           /opt/homebrew/bin/uhd_find_devices /home/linuxbrew/.linuxbrew/bin/uhd_find_devices \
+           "$(command -v uhd_find_devices || true)"; do
+    [[ -n "$c" && -x "$c" ]] && { echo "$c"; return; }
+  done
+}
+# Exact match of "name: <NAME>" in uhd_find_devices output (not a substring).
+sdr_listed() { awk -v n="$2" '{ sub(/^[ \t]+/, "") } $0 == "name: " n { f = 1 } END { exit !f }' <<< "$1"; }
 num() { [[ "$1" =~ ^-?[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?$ ]] || die "Invalid number: $1"; }
 
 [[ "$#" -ge 1 ]] || { sed -n '4,20p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
@@ -49,19 +67,17 @@ done
 if [[ -z "${UHD_IMAGES_DIR:-}" && -d "${HOME}/.local/share/uhd/images" ]]; then
   export UHD_IMAGES_DIR="${HOME}/.local/share/uhd/images"
 fi
-UHD_FIND="$(command -v uhd_find_devices || true)"
-for c in /opt/homebrew/bin/uhd_find_devices /home/linuxbrew/.linuxbrew/bin/uhd_find_devices; do
-  [[ -n "$UHD_FIND" ]] || { [[ -x "$c" ]] && UHD_FIND="$c"; }
-done
+UHD_FIND="$(uhd_find_for_tx "$TX_BIN")"
 [[ -n "$UHD_FIND" ]] || die "uhd_find_devices not found."
-DEVICE_LIST="$("$UHD_FIND")" || die "uhd_find_devices failed."
+DEVICE_LIST="$("$UHD_FIND")" || die "uhd_find_devices failed. Check the USB cable and UHD install."
 if [[ -n "${VSG_SDR_NAME:-}" ]]; then
   SDR_NAME="$VSG_SDR_NAME"
 else
   printf '%s\n' "$DEVICE_LIST"
   read -r -p "Name of the SDR (as listed above): " SDR_NAME
 fi
-grep -Fq "name: $SDR_NAME" <<< "$DEVICE_LIST" || die "SDR name '$SDR_NAME' was not listed."
+[[ -n "$SDR_NAME" ]] || die "SDR name cannot be empty."
+sdr_listed "$DEVICE_LIST" "$SDR_NAME" || die "SDR name '$SDR_NAME' was not listed."
 
 echo
 echo "Loopback cabling required:"
@@ -90,9 +106,17 @@ for g in "${GAINS[@]}"; do
     printf '{"gain": %s, "tx_exit": %s, "error": "no capture"}\n' "$g" "$st" >> "$RESULTS"
     continue
   fi
-  m="$(python3 -I "$MEASURE" "$cap" --rate "$RATE" --skip 0)"
-  printf '{"gain": %s, "tx_exit": %s, "m": %s}\n' "$g" "$st" "$m" >> "$RESULTS"
-  echo "done (exit $st)"
+  # A failed measurement must not abort the whole sweep (set -e) or write a
+  # half line that breaks the summary; record it as an error for this gain.
+  if m="$(python3 -I "$MEASURE" "$cap" --rate "$RATE" --skip 0 2>>"$log")" && [[ -n "$m" ]]; then
+    printf '{"gain": %s, "tx_exit": %s, "m": %s}\n' "$g" "$st" "$m" >> "$RESULTS"
+    echo "done (exit $st)"
+  else
+    echo "measurement failed (exit $st); see $log"
+    printf '{"gain": %s, "tx_exit": %s, "error": "measurement failed"}\n' "$g" "$st" >> "$RESULTS"
+  fi
+  # 5 = USB link failed: later gains would fail the same way.
+  [[ "$st" -ne 5 ]] || { echo "USB link to the LibreSDR failed; stopping the sweep. Replug it and retry." >&2; break; }
 done
 
 python3 -I - "$RESULTS" "$PW" "$PRI" "$CHIRP_BW" <<'PY'
@@ -106,16 +130,20 @@ prev = None
 for r in rows:
     g = r["gain"]
     if "m" not in r:
-        print(f"{g:>6}  no capture"); fails.append(f"gain {g}: no capture"); continue
+        why = r.get("error", "no capture")
+        print(f"{g:>6}  {why}"); fails.append(f"gain {g}: {why}"); continue
     m, notes = r["m"], []
     if r["tx_exit"] == 3: notes.append("TX underflow"); fails.append(f"gain {g}: TX underflow")
     elif r["tx_exit"] == 4: notes.append("RX overflow"); fails.append(f"gain {g}: RX overflow")
+    elif r["tx_exit"] == 5: notes.append("USB link failed"); fails.append(f"gain {g}: USB link failed")
     elif r["tx_exit"] not in (0,): notes.append(f"exit {r['tx_exit']}"); fails.append(f"gain {g}: exit {r['tx_exit']}")
     if m.get("clipping"): notes.append("RX CLIPPING: lower LB_RX_GAIN"); fails.append(f"gain {g}: RX clipping")
     if m.get("mode") != "pulse":
-        print(f"{g:>6} {m.get('mean_dbfs', 0):>9.2f}  no pulses found ({m.get('mode')}) - check ports/cable")
+        print(f"{g:>6} {(m.get('mean_dbfs') or float('nan')):>9.2f}  no pulses found ({m.get('mode')}) - check ports/cable")
         fails.append(f"gain {g}: no pulses (mode {m.get('mode')})"); prev = None; continue
-    top = m["top_dbfs"]
+    top = m.get("top_dbfs")
+    if top is None:
+        print(f"{g:>6}  pulse power not measurable"); fails.append(f"gain {g}: no pulse power"); prev = None; continue
     step = ""
     if prev is not None:
         d, dg = top - prev[1], g - prev[0]
@@ -131,6 +159,8 @@ for r in rows:
           f"{m.get('chirp_bw_mhz', float('nan')):>7.3f} {str(m.get('snr_db')):>6}  {'; '.join(notes)}")
     prev = (g, top)
 print()
+if not rows:
+    print("LOOPBACK CHECK: FAIL (no results)"); sys.exit(1)
 if fails:
     print("LOOPBACK CHECK: FAIL"); [print("  -", f) for f in fails]; sys.exit(1)
 print("LOOPBACK CHECK: PASS  (waveform timing, chirp, gain steps and streaming all as expected)")

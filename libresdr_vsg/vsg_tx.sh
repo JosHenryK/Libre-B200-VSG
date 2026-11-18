@@ -57,6 +57,24 @@ usage() {
 }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 num() { [[ "$1" =~ ^-?[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?$ ]] || die "Invalid number: $1"; }
+# uhd_find_devices from the SAME UHD install that tx_lfm_pulse is linked against.
+# A second UHD earlier on PATH (e.g. MacPorts in /opt/local) loads its own, different
+# firmware into the board, which the Homebrew-built transmitter then streams through.
+uhd_find_for_tx() {
+  local lib="" c
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    lib="$(otool -L "$1" 2>/dev/null | awk '/libuhd/ { print $1; exit }')"
+  else
+    lib="$(ldd "$1" 2>/dev/null | awk '/libuhd/ { print $3; exit }')"
+  fi
+  for c in ${lib:+"$(dirname "$lib")/../bin/uhd_find_devices"} \
+           /opt/homebrew/bin/uhd_find_devices /home/linuxbrew/.linuxbrew/bin/uhd_find_devices \
+           "$(command -v uhd_find_devices || true)"; do
+    [[ -n "$c" && -x "$c" ]] && { echo "$c"; return; }
+  done
+}
+# Exact match of "name: <NAME>" in uhd_find_devices output (not a substring).
+sdr_listed() { awk -v n="$2" '{ sub(/^[ \t]+/, "") } $0 == "name: " n { f = 1 } END { exit !f }' <<< "$1"; }
 db20() { awk -v a="$1" 'BEGIN { printf "%.2f", 20*log(a)/log(10) }'; }
 
 [[ "$#" -ge 1 ]] || usage
@@ -78,6 +96,8 @@ for v in "$FREQ" "$RATE" "$DURATION" "$ATTEN" "$AMPL" "$PMAX_DBM" "$MAX_AT_DUT" 
          "$CHIRP_BW" "$PW" "$PRI" "$LO_OFFSET" "$CW_OFFSET" ${GAIN:+"$GAIN"} ${POWER_DBM:+"$POWER_DBM"}; do
   num "$v"
 done
+awk -v d="$DURATION" -v r="$RATE" 'BEGIN { exit !(d >= 0 && r > 0) }' \
+  || die "Duration must be >= 0 and rate > 0."
 
 if [[ -z "${UHD_IMAGES_DIR:-}" && -d "${HOME}/.local/share/uhd/images" ]]; then
   export UHD_IMAGES_DIR="${HOME}/.local/share/uhd/images"
@@ -127,12 +147,9 @@ if [[ "${VSG_DRY_RUN:-0}" == "1" ]]; then
 fi
 
 # --- Device selection (same pattern as the collect_* scripts) --------------
-UHD_FIND="$(command -v uhd_find_devices || true)"
-for c in /opt/homebrew/bin/uhd_find_devices /home/linuxbrew/.linuxbrew/bin/uhd_find_devices; do
-  [[ -n "$UHD_FIND" ]] || { [[ -x "$c" ]] && UHD_FIND="$c"; }
-done
-[[ -x "$UHD_FIND" ]] || die "uhd_find_devices not found."
-DEVICE_LIST="$("$UHD_FIND")" || die "uhd_find_devices failed."
+UHD_FIND="$(uhd_find_for_tx "${BUILD}/tx_lfm_pulse")"
+[[ -n "$UHD_FIND" ]] || die "uhd_find_devices not found."
+DEVICE_LIST="$("$UHD_FIND")" || die "uhd_find_devices failed. Check the USB cable and UHD install."
 if [[ -n "${VSG_SDR_NAME:-}" ]]; then
   SDR_NAME="$VSG_SDR_NAME"
 else
@@ -140,7 +157,7 @@ else
   read -r -p "Name of the SDR to transmit from (as listed above): " SDR_NAME
 fi
 [[ -n "$SDR_NAME" ]] || die "SDR name cannot be empty."
-grep -Fq "name: $SDR_NAME" <<< "$DEVICE_LIST" || die "SDR name '$SDR_NAME' was not listed."
+sdr_listed "$DEVICE_LIST" "$SDR_NAME" || die "SDR name '$SDR_NAME' was not listed."
 
 if [[ "${VSG_CABLING_CONFIRMED:-0}" != "1" ]]; then
   echo "Check the cabling before continuing:"
@@ -150,34 +167,44 @@ if [[ "${VSG_CABLING_CONFIRMED:-0}" != "1" ]]; then
   [[ "$reply" == "y" || "$reply" == "Y" ]] || die "Cancelled."
 fi
 
-ARGS="type=b200,name=$SDR_NAME"
+# A deep USB send queue (as lfm_tx uses) so a short host stall doesn't underflow at high rates.
+ARGS="type=b200,name=$SDR_NAME,num_send_frames=${VSG_SEND_FRAMES:-256}"
+# tx_lfm_pulse stops itself with --duration. The UHD examples (tone, file) need an
+# external timer: GNU timeout, which macOS ships only via Homebrew coreutils (gtimeout).
 # SIGINT lets UHD send end-of-burst and close the stream cleanly on timeout.
 # --preserve-status keeps the program's own exit code (e.g. 3 = underflows).
-RUN=(timeout --preserve-status --signal=INT --kill-after=5 "$DURATION")
+RUN=()
+if [[ "$MODE" == "tone" || "$MODE" == "file" ]]; then
+  TIMEOUT="$(command -v timeout || command -v gtimeout || true)"
+  [[ -n "$TIMEOUT" ]] || die "'timeout' not found (macOS: brew install coreutils)."
+  RUN=("$TIMEOUT" --preserve-status --signal=INT --kill-after=5 "$DURATION")
+fi
 
 set +e
 case "$MODE" in
   lfm|lfm-gain|cw-gain)
     [[ -x "${BUILD}/tx_lfm_pulse" ]] || die "tx_lfm_pulse not built. Run setup_tx.sh."
     WAVE=lfm; [[ "$MODE" == "cw-gain" ]] && WAVE=cw
-    "${RUN[@]}" "${BUILD}/tx_lfm_pulse" --args="$ARGS" --mode "$WAVE" --freq "$FREQ" --rate "$RATE" \
+    "${BUILD}/tx_lfm_pulse" --args="$ARGS" --mode "$WAVE" --freq "$FREQ" --rate "$RATE" \
       --gain "$GAIN" --ampl "$AMPL" --chirp-bw "$CHIRP_BW" --pw "$PW" --pri "$PRI" \
-      --lo-offset "$LO_OFFSET" --cw-offset "$CW_OFFSET" ;;
+      --lo-offset "$LO_OFFSET" --cw-offset "$CW_OFFSET" --duration "$DURATION" ;;
   tone)
     [[ -x "${BUILD}/tx_waveforms" ]] || die "tx_waveforms not built. Run setup_tx.sh."
     WAVE_FREQ="$(awk -v r="$RATE" 'BEGIN { printf "%.0f", r/4 }')"
     echo "Tone will appear at $FREQ + $WAVE_FREQ Hz"
-    "${RUN[@]}" "${BUILD}/tx_waveforms" --args="$ARGS" --freq "$FREQ" --rate "$RATE" \
+    ${RUN[@]+"${RUN[@]}"} "${BUILD}/tx_waveforms" --args="$ARGS" --freq "$FREQ" --rate "$RATE" \
       --gain "$GAIN" --wave-type SINE --wave-freq "$WAVE_FREQ" --wave-ampl "$TONE_AMPL" ;;
   file)
     [[ -x "${BUILD}/tx_samples_from_file" ]] || die "tx_samples_from_file not built. Run setup_tx.sh."
-    "${RUN[@]}" "${BUILD}/tx_samples_from_file" --args="$ARGS" --file "$IQ_FILE" --type short \
+    ${RUN[@]+"${RUN[@]}"} "${BUILD}/tx_samples_from_file" --args="$ARGS" --file "$IQ_FILE" --type short \
       --freq "$FREQ" --rate "$RATE" --gain "$GAIN" --repeat ;;
 esac
 STATUS=$?
 set -e
 
-# 3 = tx_lfm_pulse saw underflows (PRI disturbed). 137 = had to be killed.
+# 3 = tx_lfm_pulse saw underflows (PRI disturbed). 5 = USB link failed.
+# 130 = stopped with Ctrl-C. 137 = had to be killed.
 [[ "$STATUS" -ne 3 ]] || die "Underflows occurred: PRI timing was not held. See output above."
+[[ "$STATUS" -ne 5 ]] || die "The USB link to the LibreSDR failed. Replug it (USB 3, no hub) and retry."
 [[ "$STATUS" -eq 0 ]] || die "Transmit exited with status $STATUS."
 echo "Transmission finished."
