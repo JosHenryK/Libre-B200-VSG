@@ -23,7 +23,10 @@ import numpy as np
 
 
 def load(path, dtype, skip):
-    raw = np.fromfile(path, dtype=np.int16 if dtype == "int16" else np.float32)
+    try:
+        raw = np.fromfile(path, dtype=np.int16 if dtype == "int16" else np.float32)
+    except OSError as e:
+        sys.exit(f"cannot read {path}: {e}")
     if raw.size % 2:
         raw = raw[:-1]
     x = raw[0::2].astype(np.float64) + 1j * raw[1::2].astype(np.float64)
@@ -76,7 +79,7 @@ def measure(x, rate, fullscale):
     # outside the true edge on each side; remove that widening.
     widths = stops - starts - (w - 1) / 2
     tops, freqs_bw = [], []
-    for s, e in zip(starts, stops):
+    for s, e, width in zip(starts, stops, widths):
         n = e - s
         a, b = s + n // 10, e - n // 10  # central 80 % = the flat pulse top
         if b <= a:
@@ -86,7 +89,8 @@ def measure(x, rate, fullscale):
         if ph.size > 8:
             t = np.arange(ph.size) / rate
             slope = np.polyfit(t, ph, 2)[0] * 2 / (2 * np.pi)  # Hz/s
-            freqs_bw.append(slope * n / rate)
+            # Sweep = chirp rate x true pulse width (not the smoothing-widened n).
+            freqs_bw.append(slope * max(width, 1) / rate)
 
     off = ~np.convolve(on, np.ones(4 * w + 1), mode="same").astype(bool)
     noise = p[off].mean() if off.any() else 0.0
@@ -126,11 +130,19 @@ def main():
     ap.add_argument("--skip", type=float, default=0.01,
                     help="seconds to drop from the start (receiver settling)")
     a = ap.parse_args()
+    if not a.rate > 0:
+        sys.exit("--rate must be positive")
+    if a.skip < 0:
+        sys.exit("--skip must be >= 0")
     fs = a.fullscale or (32768.0 if a.dtype == "int16" else 1.0)
+    if not fs > 0:
+        sys.exit("--fullscale must be positive")
     x = load(a.file, a.dtype, int(a.skip * a.rate))
     if x.size == 0:
         sys.exit("capture is empty after --skip")
-    print(json.dumps(measure(x, a.rate, fs)))
+    # allow_nan=False: emit strict JSON (no -Infinity) for downstream parsers.
+    out = {k: (None if isinstance(v, float) and not np.isfinite(v) else v) for k, v in measure(x, a.rate, fs).items()}
+    print(json.dumps(out, allow_nan=False))
 
 
 if __name__ == "__main__":

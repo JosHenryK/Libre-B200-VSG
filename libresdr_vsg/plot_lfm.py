@@ -12,10 +12,22 @@ import numpy as np  # noqa: E402
 
 BLUE, VIOLET, INK2, GRID = "#2a78d6", "#6250d6", "#52514e", "#e4e3df"
 
-path, rate, pw_us, pri_ms, out = sys.argv[1], float(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4]), sys.argv[5]
+if len(sys.argv) != 6:
+    sys.exit(__doc__.strip())
+try:
+    path, rate, pw_us, pri_ms, out = sys.argv[1], float(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4]), sys.argv[5]
+except ValueError:
+    sys.exit(__doc__.strip())
+if not (rate > 0 and pw_us > 0 and pri_ms > 0):
+    sys.exit("rate, pw_us and pri_ms must be positive")
 raw = np.fromfile(path, dtype=np.int16).astype(float) / 32767
+if raw.size % 2:
+    raw = raw[:-1]
 x = raw[0::2] + 1j * raw[1::2]
-s = int(np.flatnonzero(np.abs(x) > 0.01)[0])  # first pulse start
+nz = np.flatnonzero(np.abs(x) > 0.01)
+if x.size == 0 or nz.size == 0:
+    sys.exit(f"{path}: no pulse found (file empty or amplitude too low)")
+s = int(nz[0])  # first pulse start
 
 fig, (top, bot) = plt.subplots(2, 1, figsize=(10, 6.5))
 fig.suptitle(f"lfm_tx signal: 5.18 GHz, {rate / 1e6:g} MS/s, 1 MHz LFM, {pw_us:g} µs pulse, {pri_ms:g} ms PRI",

@@ -66,7 +66,7 @@ DEVICE_LIST="$("$UHD_FIND")" || die "uhd_find_devices failed. Check USB connecti
 printf '%s\n\n' "$DEVICE_LIST"
 read -r -p "Name for the transmitting SDR (as listed above): " SDR_NAME
 [[ -n "$SDR_NAME" ]] || die "SDR name cannot be empty."
-grep -Fq "name: $SDR_NAME" <<< "$DEVICE_LIST" || die "SDR name '$SDR_NAME' was not listed by uhd_find_devices."
+awk -v n="$SDR_NAME" '{ sub(/^[ \t]+/, "") } $0 == "name: " n { f = 1 } END { exit !f }' <<< "$DEVICE_LIST" || die "SDR name '$SDR_NAME' was not listed by uhd_find_devices."
 
 echo "WARNING: This emits RF. Confirm the antenna/load, frequency authorization, and a safe gain before continuing."
 echo "Frequency: $FREQ Hz; rate: $RATE samples/s; pulse: $PULSE_WIDTH s; PRI: $PRI s; gain: $GAIN dB; duration: $DURATION s"

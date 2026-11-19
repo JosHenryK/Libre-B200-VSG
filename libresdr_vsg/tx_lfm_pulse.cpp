@@ -16,7 +16,10 @@
 #include <cmath>
 #include <complex>
 #include <csignal>
+#include <cstdio>
+#include <cstdlib>
 #include <cstdint>
+#include <exception>
 #include <fstream>
 #include <iostream>
 #include <thread>
@@ -32,7 +35,7 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
     std::string args, mode, dump_file, rx_file, rx_ant;
     size_t dump_pris;
     double rx_gain, rx_seconds;
-    double freq, rate, gain, bw_chirp, pw, pri, ampl, duration, lo_offset, analog_bw, cw_offset;
+    double freq, rate, gain, bw_chirp, pw, pri, ampl, duration, lo_offset, analog_bw, cw_offset, start_delay;
 
     po::options_description desc("tx_lfm_pulse options");
     // clang-format off
@@ -57,6 +60,7 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
         ("rx-gain", po::value<double>(&rx_gain)->default_value(10.0), "loopback: RX gain (dB)")
         ("rx-seconds", po::value<double>(&rx_seconds)->default_value(0.05), "loopback: capture length (s)")
         ("rx-ant", po::value<std::string>(&rx_ant)->default_value(""), "loopback: RX antenna (blank = UHD default, RX2)")
+        ("start-delay", po::value<double>(&start_delay)->default_value(0.3), "seconds between stream setup and the first sample on air; the host pre-fills the radio's buffers in this time (0 = start immediately)")
     ;
     // clang-format on
     po::variables_map vm;
@@ -69,6 +73,10 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
 
     if (mode != "lfm" && mode != "cw") throw std::runtime_error("--mode must be lfm or cw");
     if (!(ampl > 0.0 && ampl <= 1.0)) throw std::runtime_error("--ampl must be in (0, 1]");
+    if (!(rate > 0.0)) throw std::runtime_error("--rate must be positive");
+    if (duration < 0.0) throw std::runtime_error("--duration must be >= 0");
+    if (start_delay < 0.0 || start_delay > 5.0) throw std::runtime_error("--start-delay must be 0-5 s");
+    if (!rx_file.empty() && !(rx_seconds > 0.0)) throw std::runtime_error("--rx-seconds must be positive");
 
     const size_t pri_samps = size_t(std::llround(pri * rate));
     const size_t pw_samps  = size_t(std::llround(pw * rate));
@@ -187,8 +195,11 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
     std::thread rx_thread;
     if (rx) {
         rx_thread = std::thread([&]() {
-            // Let the TX stream settle before recording.
-            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+          try {
+            // Let the TX stream settle before recording (after its timed start).
+            std::this_thread::sleep_for(std::chrono::milliseconds(300)
+                                        + std::chrono::duration_cast<std::chrono::milliseconds>(
+                                            std::chrono::duration<double>(start_delay)));
             const size_t n = size_t(std::llround(rx_seconds * rate));
             std::vector<std::complex<int16_t>> cap(n);
             uhd::stream_cmd_t cmd(uhd::stream_cmd_t::STREAM_MODE_NUM_SAMPS_AND_DONE);
@@ -210,13 +221,18 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
             std::ofstream out(rx_file, std::ios::binary);
             out.write(reinterpret_cast<const char*>(cap.data()), std::streamsize(got * sizeof(cap[0])));
             if (got < n) rx_error = 1;
-            rx_done = true;
+          } catch (const std::exception& e) {
+            std::cerr << "\nRX error: " << e.what() << std::endl;
+            rx_error = 1;
+          }
+          rx_done = true;
         });
     }
 
-    // Count underflows from the async message channel.
-    std::atomic<size_t> underflows{0};
+    // Count underflows (and other stream faults) from the async message channel.
+    std::atomic<size_t> underflows{0}, late_packets{0}, seq_errors{0};
     std::thread async_thread([&]() {
+      try {
         uhd::async_metadata_t amd;
         while (!stop_signal_called) {
             if (!tx->recv_async_msg(amd, 0.1)) continue;
@@ -225,8 +241,22 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
                 if (underflows++ == 0)
                     std::cerr << "\nWARNING: underflow - the computer could not keep up, so the signal now has"
                                  " gaps.\n         Use a USB 3 connection or a lower --rate." << std::endl;
+            } else if (amd.event_code == uhd::async_metadata_t::EVENT_CODE_TIME_ERROR) {
+                // The first packet reached the radio after its scheduled start time.
+                if (late_packets++ == 0)
+                    std::cerr << "\nWARNING: first samples arrived after the scheduled start;"
+                                 " raise --start-delay." << std::endl;
+            } else if (amd.event_code == uhd::async_metadata_t::EVENT_CODE_SEQ_ERROR
+                       || amd.event_code == uhd::async_metadata_t::EVENT_CODE_SEQ_ERROR_IN_BURST) {
+                // Packets lost between host and radio (USB trouble).
+                if (seq_errors++ == 0)
+                    std::cerr << "\nWARNING: packets lost on USB (sequence error)." << std::endl;
             }
         }
+      } catch (const std::exception& e) {
+        std::cerr << "\nAsync message error: " << e.what() << std::endl;
+        stop_signal_called = true;
+      }
     });
 
     std::signal(SIGINT, &sig_int_handler);
@@ -241,35 +271,85 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
     md.start_of_burst = true;
     md.end_of_burst   = false;
     md.has_time_spec  = false;
+    // Schedule the first sample slightly in the future. With an untimed start the
+    // DAC begins playing the moment the first packet lands, so the host must keep
+    // up from sample zero with empty buffers, which is exactly when the Mac is busiest
+    // (UHD just loaded the FPGA). A timed start lets the host fill the radio's buffer
+    // and the whole USB send queue first, which removes the start-up underflows.
+    if (start_delay > 0) {
+        usrp->set_time_now(uhd::time_spec_t(0.0));
+        md.has_time_spec = true;
+        md.time_spec     = uhd::time_spec_t(start_delay);
+    }
 
     const auto t_end = std::chrono::steady_clock::now()
                        + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
                            std::chrono::duration<double>(duration));
-    while (!stop_signal_called) {
-        if (duration > 0 && std::chrono::steady_clock::now() >= t_end) break;
-        if (rx && rx_done) break;
-        size_t sent = 0;
-        while (sent < tx_buf.size() && !stop_signal_called) {
-            sent += tx->send(&tx_buf[sent], tx_buf.size() - sent, md, 0.5);
-            md.start_of_burst = false;
+    // Any exception from UHD (e.g. a USB send failure) is held until the worker
+    // threads are joined. Letting it unwind past a joinable std::thread would call
+    // std::terminate ("libc++abi: terminating") and hide the real error message.
+    std::exception_ptr tx_error;
+    std::chrono::steady_clock::time_point stalled_since{};
+    try {
+        while (!stop_signal_called) {
+            if (duration > 0 && std::chrono::steady_clock::now() >= t_end) break;
+            if (rx && rx_done) break;
+            size_t sent = 0;
+            while (sent < tx_buf.size() && !stop_signal_called) {
+                // The first call may block for the start delay while buffers fill.
+                const size_t n = tx->send(&tx_buf[sent], tx_buf.size() - sent, md,
+                                          md.has_time_spec ? start_delay + 1.0 : 0.5);
+                sent += n;
+                if (n > 0) {
+                    md.start_of_burst = false;
+                    md.has_time_spec  = false;
+                    stalled_since     = {};
+                } else {
+                    // send() timed out with nothing accepted: the radio stopped draining.
+                    const auto now = std::chrono::steady_clock::now();
+                    if (stalled_since == std::chrono::steady_clock::time_point{}) stalled_since = now;
+                    else if (now - stalled_since > std::chrono::seconds(3))
+                        throw std::runtime_error("the radio stopped accepting samples for 3 s (USB link stalled)");
+                }
+            }
         }
-    }
 
-    // Close the burst cleanly so the DAC returns to idle.
-    md.end_of_burst = true;
-    tx->send("", 0, md);
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        // Close the burst cleanly so the DAC returns to idle.
+        md.end_of_burst  = true;
+        md.has_time_spec = false;
+        tx->send("", 0, md);
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    } catch (...) {
+        tx_error = std::current_exception();
+    }
     stop_signal_called = true;
     async_thread.join();
     if (rx_thread.joinable()) rx_thread.join();
+    if (tx_error) {
+        std::string what = "unknown error";
+        try { std::rethrow_exception(tx_error); }
+        catch (const std::exception& e) { what = e.what(); }
+        catch (...) {}
+        std::cerr << "\nERROR: transmit stopped after " << underflows.load() << " underflow(s): " << what
+                  << "\n       The USB link to the LibreSDR failed. Unplug it, wait 5 s, plug it back in"
+                     "\n       (straight into the Mac, USB 3 cable) and run again." << std::endl;
+        // Skip UHD's destructors: after a USB failure they throw again while the
+        // stream is torn down, which aborts the process (libc++abi: terminating).
+        // The OS releases the USB device when the process exits.
+        std::fflush(nullptr);
+        std::_Exit(5);
+    }
 
     std::cout << "Stopped. Underflows: " << underflows.load()
               << (underflows.load() ? "  <-- PRI was disturbed; lower rate or reduce host load" : "")
               << std::endl;
+    if (late_packets.load() || seq_errors.load())
+        std::cout << "Late start: " << late_packets.load() << ", USB sequence errors: " << seq_errors.load()
+                  << std::endl;
     if (rx)
         std::cout << "Loopback capture: " << (rx_error ? "INCOMPLETE" : "complete")
                   << ", overflows: " << overflows.load() << std::endl;
-    if (underflows.load()) return 3;
+    if (underflows.load() || seq_errors.load()) return 3;
     if (rx && (overflows.load() || rx_error)) return 4;
     return EXIT_SUCCESS;
 }

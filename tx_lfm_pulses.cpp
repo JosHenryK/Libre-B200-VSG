@@ -3,6 +3,8 @@
 #include <uhd/utils/thread.hpp>
 
 #include <algorithm>
+#include <atomic>
+#include <csignal>
 #include <chrono>
 #include <cmath>
 #include <complex>
@@ -17,6 +19,8 @@
 
 namespace {
 constexpr double kTwoPi = 6.28318530717958647692;
+std::atomic<bool> stop_requested{false};
+void on_signal(int) { stop_requested = true; }
 
 struct options {
     std::string args;
@@ -119,20 +123,62 @@ int main(int argc, char* argv[]) {
                   << "PRI: " << opt.pri_s << " s (" << pri_samples << " samples)\n"
                   << "Pulses: " << repetitions << " (" << repetitions * opt.pri_s << " s on-air)\n";
 
-        uhd::tx_metadata_t metadata;
-        for (size_t repetition = 0; repetition < repetitions; ++repetition) {
-            size_t offset = 0;
-            while (offset < frame.size()) {
-                const size_t count = std::min(tx_stream->get_max_num_samps(), frame.size() - offset);
-                metadata.start_of_burst = repetition == 0 && offset == 0;
-                metadata.end_of_burst = repetition + 1 == repetitions && offset + count == frame.size();
-                const size_t sent = tx_stream->send(&frame[offset], count, metadata);
-                if (sent != count) throw std::runtime_error("short transmit write");
-                offset += sent;
+        // Count underflows so a disturbed PRI is reported, not silent.
+        std::atomic<size_t> underflows{0};
+        std::atomic<bool> done{false};
+        std::thread async_thread([&]() {
+            try {
+                uhd::async_metadata_t amd;
+                while (!done) {
+                    if (!tx_stream->recv_async_msg(amd, 0.1)) continue;
+                    if (amd.event_code == uhd::async_metadata_t::EVENT_CODE_UNDERFLOW ||
+                        amd.event_code == uhd::async_metadata_t::EVENT_CODE_UNDERFLOW_IN_PACKET)
+                        ++underflows;
+                }
+            } catch (const std::exception& e) {
+                std::cerr << "async message error: " << e.what() << '\n';
             }
+        });
+        std::signal(SIGINT, on_signal);
+        std::signal(SIGTERM, on_signal);
+
+        uhd::tx_metadata_t metadata;
+        // Timed start 0.3 s ahead: the host fills the radio's buffers before the
+        // first sample plays, instead of racing an empty FIFO from sample zero.
+        usrp->set_time_now(uhd::time_spec_t(0.0));
+        metadata.has_time_spec = true;
+        metadata.time_spec = uhd::time_spec_t(0.3);
+        std::exception_ptr error;
+        try {
+            for (size_t repetition = 0; repetition < repetitions && !stop_requested; ++repetition) {
+                size_t offset = 0;
+                while (offset < frame.size() && !stop_requested) {
+                    const size_t count = std::min(tx_stream->get_max_num_samps(), frame.size() - offset);
+                    metadata.start_of_burst = repetition == 0 && offset == 0;
+                    metadata.end_of_burst = repetition + 1 == repetitions && offset + count == frame.size();
+                    const size_t sent = tx_stream->send(&frame[offset], count, metadata,
+                                                        metadata.has_time_spec ? 1.5 : 0.5);
+                    if (sent != count) throw std::runtime_error("short transmit write (radio stopped accepting samples)");
+                    metadata.has_time_spec = false;
+                    offset += sent;
+                }
+            }
+            if (stop_requested) {  // Ctrl-C: close the burst so the DAC goes idle
+                metadata.start_of_burst = false;
+                metadata.end_of_burst = true;
+                metadata.has_time_spec = false;
+                tx_stream->send("", 0, metadata);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        } catch (...) {
+            error = std::current_exception();
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        std::cout << "Transmit complete.\n";
+        done = true;
+        async_thread.join();  // never let a joinable thread be destroyed (std::terminate)
+        if (error) std::rethrow_exception(error);
+        std::cout << (stop_requested ? "Transmit stopped.\n" : "Transmit complete.\n")
+                  << "Underflows: " << underflows.load() << '\n';
+        if (underflows.load()) return 3;
     } catch (const std::exception& error) {
         std::cerr << "ERROR: " << error.what() << '\n';
         return 1;
